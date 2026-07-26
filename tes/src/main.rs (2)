@@ -1,0 +1,183 @@
+
+#![recursion_limit = "1024"]
+
+use f_audio::*;
+
+// ==========================================
+// 7. MAIN APPLICATION
+// ==========================================
+// Ganti bagian macro main atau fungsi main Anda dengan struktur baru ini
+
+
+// WAJIB diletakkan di baris paling atas (baris 1) di file main.rs Anda:
+
+fn main() {
+    println!("[INFO] Merender lagu penuh 'Somewhere Only We Know' (~3.5 menit)...");
+    println!("[INFO] Tunggu sebentar, kalkulasi DSP memakan waktu beberapa detik.");
+
+    audio!(my_audio, {
+        kick_luar = read("kick1.wav"),
+        snare_luar = read("snare1.wav"),
+
+        drum {
+            beat => {
+                volume: 45, // Volume drum diturunkan sedikit agar vokal/piano lebih menonjol
+                loop {
+                    // Ketukan 4/4 standar: 1 Bar = 1000ms
+                    kick_luar, gap(500), 
+                    snare_luar, gap(500), 
+                    kick_luar, gap(500), 
+                    snare_luar, gap(500)
+                }
+            }
+        },
+        
+        bass {
+            bassline_1 => {
+                volume: 90,
+                loop {
+                    C, gap(500), 
+                    C, gap(500), 
+                    F, gap(1000)
+                }
+            }
+        },
+        
+        flute {
+            melody_high => {
+                volume: 85, // Volume menonjol untuk melodi tiup atas
+                loop {
+                    // Seruling merespon di oktaf atas dengan j jeda napas yang smooth
+                    gap(500), E, gap(500), G, gap(500), B, gap(500),
+                    A, gap(1000), F, gap(1000)
+                }
+            }
+        },
+        
+        sax {
+            melody_solo => {
+                volume: 90, // Volume sengaja dibuat dominan
+                loop {
+                    A, gap(500), C, gap(500), E, gap(1000),
+                    D, gap(500), F, gap(500), A, gap(1000)
+                }
+            }
+        },
+
+        piano {
+            keane_cover => {
+                volume: 500,
+                once {
+                    // ==========================================
+                    // INTRO (2x)
+                    // ==========================================
+                    C, gap(1000), C_B, gap(1000), Dm, gap(1000), Gsus4, gap(500), G, gap(500),
+                    C, gap(1000), C_B, gap(1000), Dm, gap(1000), Gsus4, gap(500), G, gap(500),
+
+                    // ==========================================
+                    // VERSE 1
+                    // ==========================================
+                    // I walked across an empty land
+                    C, gap(1000), C_B, gap(1000), Dm, gap(1000), Gsus4, gap(500), G, gap(500),
+                    // I knew the pathway like the back of my hand
+                    C, gap(1000), C_B, gap(1000), Dm, gap(1000), Gsus4, gap(500), G, gap(500),
+
+                    // ==========================================
+                    // PRE-CHORUS 1
+                    // ==========================================
+                    // Oh, simple thing, where have you gone?
+                    Am, gap(1000), Em, gap(1000), F, gap(1000), G, gap(1000),
+                    // So tell me when you're gonna let me in
+                    Am, gap(1000), Em, gap(1000), F, gap(1000), G, gap(1000),
+
+                    // ==========================================
+                    // VERSE 2
+                    // ==========================================
+                    // I came across a fallen tree
+                    C, gap(1000), C_B, gap(1000), Dm, gap(1000), Gsus4, gap(500), G, gap(500),
+                    // Is this the place we used to love?
+                    C, gap(1000), C_B, gap(1000), Dm, gap(1000), Gsus4, gap(500), G, gap(500),
+
+                    // ==========================================
+                    // PRE-CHORUS 2
+                    // ==========================================
+                    Am, gap(1000), Em, gap(1000), F, gap(1000), G, gap(1000),
+                    Am, gap(1000), Em, gap(1000), F, gap(1000), G, gap(1000),
+
+                    // ==========================================
+                    // CHORUS 1
+                    // ==========================================
+                    // And if you have a minute, why don't we go
+                    F, gap(1000), C_E, gap(1000), G, gap(2000),
+                    // Talk about it somewhere only we know?
+                    F, gap(1000), C_E, gap(1000), G, gap(2000),
+                    // This could be the end of everything
+                    F, gap(1000), C_E, gap(1000), G, gap(1000), F, gap(1000),
+                    // So why don't we go
+                    G, gap(2000), F, gap(2000),
+                    // Somewhere only we know?
+                    G, gap(1000), F, gap(1000), G, gap(2000),
+
+                    // ==========================================
+                    // PRE-CHORUS 3
+                    // ==========================================
+                    Am, gap(1000), Em, gap(1000), F, gap(1000), G, gap(1000),
+                    Am, gap(1000), Em, gap(1000), F, gap(1000), G, gap(1000),
+
+                    // ==========================================
+                    // CHORUS 2 (Variasi Dm)
+                    // ==========================================
+                    // And if you have a minute, why don't we go
+                    Dm, gap(1000), C_E, gap(1000), G, gap(2000),
+                    // Talk about it somewhere only we know?
+                    Dm, gap(1000), C_E, gap(1000), G, gap(2000),
+                    // This could be the end of everything
+                    Dm, gap(1000), C_E, gap(1000), G, gap(1000), F, gap(1000),
+                    // So why don't we go?
+                    F, gap(1000), G, gap(3000),
+
+                    // ==========================================
+                    // BRIDGE (Oohs)
+                    // ==========================================
+                    Dm, gap(1000), C_E, gap(1000), G, gap(2000),
+                    Dm, gap(1000), C_E, gap(1000), G, gap(2000),
+
+                    // ==========================================
+                    // OUTRO
+                    // ==========================================
+                    // This could be the end of everything
+                    Dm, gap(1000), C_E, gap(1000), G, gap(1000), F, gap(1000),
+                    // So why don't we go somewhere only we know
+                    G, gap(2000), C, gap(1000), F, gap(1000),
+                    // Somewhere only we know
+                    G, gap(2000), F, gap(2000),
+                    // Somewhere only we know
+                    G, gap(2000), F, gap(1000), C, gap(2000) // Akor terakhir decay lebih lama
+                }
+            }
+        },
+
+        start(
+            drum => beat,
+            bass => bassline_1,
+            piano => keane_cover,
+            flute => melody_high,
+            sax => melody_solo
+        ),
+        
+        // Total kalkulasi durasi lagu adalah 218.000 ms (218 detik / 3 menit 38 detik)
+        // Kita beri gap 220.000 ms agar ekor reverb/decay dari akor terakhir selesai dengan natural
+        gap(210000),
+
+        stop(
+            drum => beat,
+            bass => bassline_1,
+            piano => keane_cover,
+            flute => melody_high,
+            sax => melody_solo
+        )
+    });
+    
+    save(&my_audio, "my_audio.wav");
+    play(&my_audio);
+}

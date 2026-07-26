@@ -1,0 +1,611 @@
+use rodio::{DeviceSinkBuilder, Player};
+use rodio::buffer::SamplesBuffer;
+use std::collections::HashMap;
+use std::num::NonZero;
+
+// ==========================================
+// 1. STRUKTUR DATA & CORE MODEL
+// ==========================================
+
+#[derive(Clone, Debug)]
+pub enum Sound {
+    PianoNote(u8),
+    PianoChord(String),
+    DrumBass,
+    DrumSnare,
+    AcousticA,
+    AcousticD,
+    BassNote(String),
+    SaxNote(String),
+    FluteNote(String), // <--- [BARU] Instrumen Seruling
+    Sample(String), 
+}
+
+#[derive(Clone, Debug)]
+pub enum PatternElement {
+    Play(Sound),   
+    Wait(usize),   
+}
+
+pub enum Command {
+    Start(String, String), 
+    Stop(String, String),  
+    Gap(u64),
+}
+
+pub struct PlayingVoice {
+    sound: Sound,
+    sample_idx: usize,
+}
+
+pub struct ActiveTrackState {
+    inst: String,
+    track_id: String,
+    pattern: Vec<PatternElement>,
+    volume: f32, 
+    event_idx: usize,
+    wait_samples: usize,
+    is_looping: bool,
+    playing_voices: Vec<PlayingVoice>, 
+}
+
+pub struct Project {
+    patterns: HashMap<String, HashMap<String, (Vec<PatternElement>, f32, bool)>>,
+    commands: Vec<Command>,
+    external_samples: HashMap<String, Vec<f32>>, 
+}
+
+impl Project {
+    pub fn new() -> Self {
+        Project {
+            patterns: HashMap::new(),
+            commands: Vec::new(),
+            external_samples: HashMap::new(),
+        }
+    }
+    pub fn add_pattern(&mut self, inst: &str, id: &str, pattern: Vec<PatternElement>, volume: f32, is_looping: bool) {
+        self.patterns
+            .entry(inst.to_string())
+            .or_insert_with(HashMap::new)
+            .insert(id.to_string(), (pattern, volume, is_looping));
+    }
+    pub fn add_command(&mut self, cmd: Command) {
+        self.commands.push(cmd);
+    }
+    pub fn load_external_sample(&mut self, name: &str, path: &str) {
+        self.external_samples.insert(name.to_string(), read_wav(path));
+    }
+}
+
+// ==========================================
+// 2. MULTI-FORMAT WAV LOADER
+// ==========================================
+
+pub fn read_wav(file_path: &str) -> Vec<f32> {
+    let mut reader = match hound::WavReader::open(file_path) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[ERROR] Gagal membuka file '{}': {}. Fallback ke silence.", file_path, e);
+            return vec![0.0; 4410]; 
+        }
+    };
+    
+    let spec = reader.spec();
+    let mut raw_samples = Vec::new();
+    
+    match (spec.sample_format, spec.bits_per_sample) {
+        (hound::SampleFormat::Int, 16) => {
+            for sample in reader.samples::<i16>() {
+                if let Ok(s) = sample { raw_samples.push(s as f32 / i16::MAX as f32); }
+            }
+        }
+        (hound::SampleFormat::Int, 24) => {
+            for sample in reader.samples::<i32>() {
+                if let Ok(s) = sample { raw_samples.push(s as f32 / 8388607.0); }
+            }
+        }
+        (hound::SampleFormat::Int, 32) => {
+            for sample in reader.samples::<i32>() {
+                if let Ok(s) = sample { raw_samples.push(s as f32 / i32::MAX as f32); }
+            }
+        }
+        (hound::SampleFormat::Float, 32) => {
+            for sample in reader.samples::<f32>() {
+                if let Ok(s) = sample { raw_samples.push(s); }
+            }
+        }
+        _ => {
+            eprintln!("[WARN] Format WAV '{}' ({} bit) tidak didukung.", file_path, spec.bits_per_sample);
+            return vec![0.0; 4410];
+        }
+    }
+    
+    if spec.channels == 2 {
+        let mut mono = Vec::new();
+        for chunk in raw_samples.chunks(2) {
+            if chunk.len() == 2 { mono.push((chunk[0] + chunk[1]) / 2.0); }
+        }
+        raw_samples = mono;
+    }
+    
+    println!("[SUCCESS] Loaded '{}' ({} samples)", file_path, raw_samples.len());
+    raw_samples
+}
+
+// ==========================================
+// 3. SEPARATED DSP FUNCTIONS
+// ==========================================
+
+pub fn synth_piano(note: u8, t: f32) -> f32 {
+    let freq = match note {
+        1 => 261.63, 2 => 293.66, 3 => 329.63, 4 => 349.23,
+        5 => 392.00, 6 => 440.00, 7 => 493.88, 8 => 523.26,
+        _ => 0.0,
+    };
+    if freq == 0.0 { return 0.0; }
+    let tone = (2.0 * std::f32::consts::PI * freq * t).sin()
+        + 0.4 * (2.0 * std::f32::consts::PI * 2.0 * freq * t).sin();
+    tone * (-t * 4.0).exp() * 0.3 
+}
+
+pub fn synth_piano_chord(chord: &str, t: f32) -> f32 {
+    let freqs = match chord {
+        "C"     => vec![261.63, 329.63, 392.00],
+        "C_B"   => vec![246.94, 261.63, 329.63, 392.00],
+        "Dm"    => vec![293.66, 349.23, 440.00],
+        "Gsus4" => vec![392.00, 440.00, 523.25],
+        "G"     => vec![392.00, 493.88, 587.33],
+        "Am"    => vec![220.00, 329.63, 440.00],
+        "Em"    => vec![164.81, 246.94, 329.63],
+        "F"     => vec![174.61, 261.63, 349.23],
+        "C_E"   => vec![164.81, 261.63, 329.63, 392.00],
+        _       => vec![0.0],
+    };
+    freqs.iter().map(|&f| (2.0 * std::f32::consts::PI * f * t).sin() * 0.2).sum::<f32>() * (-t * 2.0).exp()
+}
+
+pub fn synth_kick(sample_idx: usize, t: f32) -> f32 {
+    let pitch_env = (-t * 55.0).exp();
+    let freq = 45.0 + 160.0 * pitch_env; 
+    let body = (2.0 * std::f32::consts::PI * freq * t).sin();
+    let click = (((sample_idx * 12345) % 71) as f32 / 35.5 - 1.0) * (-t * 150.0).exp() * 0.15;
+    (body + click) * (-t * 14.0).exp() * 1.1
+}
+
+pub fn synth_snare(sample_idx: usize, t: f32) -> f32 {
+    let tone = (2.0 * std::f32::consts::PI * 185.0 * t).sin() * (-t * 35.0).exp() * 0.25;
+    let noise = (((sample_idx * 54321) % 113) as f32 / 56.5 - 1.0) * (-t * 20.0).exp() * 0.65;
+    (tone + noise) * 0.7
+}
+
+pub fn synth_acoustic(chord_type: &Sound, t: f32) -> f32 {
+    let freqs = match chord_type {
+        Sound::AcousticA => vec![220.0, 329.63, 440.0, 554.37],
+        _ => vec![146.83, 220.0, 293.66, 369.99],
+    };
+    freqs.iter().enumerate().map(|(i, &f)| {
+        let strum_delay = i as f32 * 0.022;
+        if t > strum_delay {
+            let st = t - strum_delay;
+            (2.0 * std::f32::consts::PI * f * st).sin() * (-st * 3.5).exp()
+        } else { 0.0 }
+    }).sum::<f32>() * 0.3
+}
+
+pub fn synth_bass(note: &str, t: f32) -> f32 {
+    let freq = match note {
+        "C" => 65.41, "D" => 73.42, "E" => 82.41, "F" => 87.31, "G" => 98.00, "A" => 55.00, "B" => 61.74,
+        _ => 0.0,
+    };
+    if freq == 0.0 { return 0.0; }
+    let w = 2.0 * std::f32::consts::PI * freq * t;
+    let body = w.sin() + 0.5 * (w * 2.0).sin();
+    let pluck = (-t * 40.0).exp() * (w * 4.0).sin(); 
+    (body + pluck) * (-t * 1.5).exp() * 0.6
+}
+
+pub fn synth_sax(note: &str, t: f32) -> f32 {
+    let freq = match note {
+        "C" => 523.25, "D" => 587.33, "E" => 659.25, "F" => 698.46, "G" => 783.99, "A" => 440.00, "B" => 493.88,
+        _ => 0.0,
+    };
+    if freq == 0.0 { return 0.0; }
+    let vibrato = 1.0 + 0.012 * (2.0 * std::f32::consts::PI * 5.8 * t).sin();
+    let base_w = 2.0 * std::f32::consts::PI * freq * vibrato * t;
+    let tone = base_w.sin() + 0.55 * (base_w * 2.0).sin() + 0.35 * (base_w * 3.0).sin() + 0.15 * (base_w * 4.0).sin();
+    let attack = 1.0 - (-t * 14.0).exp();
+    let decay = (-t * 0.9).exp();
+    tone * attack * decay * 0.22
+}
+
+// <--- [BARU] DSP Fungsi untuk Seruling (Sine-dominant + Chiff/Noise tiupan awal)
+pub fn synth_flute(note: &str, sample_idx: usize, t: f32) -> f32 {
+    let freq = match note {
+        "C" => 523.25, // Di-set pada oktaf tinggi agar karakternya keluar
+        "D" => 587.33,
+        "E" => 659.25,
+        "F" => 698.46,
+        "G" => 783.99,
+        "A" => 880.00, 
+        "B" => 987.77,
+        _ => 0.0,
+    };
+    if freq == 0.0 { return 0.0; }
+
+    // Vibrato udara tipis sekitar 6.2 Hz
+    let vibrato = 1.0 + 0.009 * (2.0 * std::f32::consts::PI * 6.2 * t).sin();
+    let base_w = 2.0 * std::f32::consts::PI * freq * vibrato * t;
+
+    // Nada murni khas seruling (Dominan sine wave + sedikit overton harmonik kedua)
+    let tone = base_w.sin() + 0.12 * (base_w * 2.0).sin();
+
+    // Chiff Noise (Suara desis angin saat transisi/tiupan awal)
+    let breath_noise = (((sample_idx * 31337) % 97) as f32 / 48.5 - 1.0) * (-t * 70.0).exp() * 0.15;
+
+    // Envelope tiupan seruling: cepat tapi lembut di awal
+    let attack = 1.0 - (-t * 28.0).exp();
+    let decay = (-t * 0.75).exp();
+
+    (tone + breath_noise) * attack * decay * 0.24
+}
+
+// ==========================================
+// 4. ENGINE CORE MIXER
+// ==========================================
+
+pub fn render_project(project: &Project) -> Vec<f32> {
+    let sample_rate = 44100.0;
+    let mut mixed_output = Vec::new();
+    let mut active_tracks: Vec<ActiveTrackState> = Vec::new();
+    let mut current_global_sample: usize = 0; 
+
+    for cmd in &project.commands {
+        match cmd {
+            Command::Start(inst, track_id) => {
+                if !active_tracks.iter().any(|t| &t.inst == inst && &t.track_id == track_id) {
+                    if let Some(inst_map) = project.patterns.get(inst) {
+                        if let Some((pattern, volume, is_looping)) = inst_map.get(track_id) {
+                            active_tracks.push(ActiveTrackState {
+                                inst: inst.clone(),
+                                track_id: track_id.clone(),
+                                pattern: pattern.clone(),
+                                volume: *volume,
+                                event_idx: 0,
+                                wait_samples: 0,
+                                is_looping: *is_looping,
+                                playing_voices: Vec::new(),
+                            });
+                        }
+                    }
+                }
+            }
+            Command::Stop(inst, track_id) => {
+                active_tracks.retain(|t| !(&t.inst == inst && &t.track_id == track_id));
+            }
+            Command::Gap(ms) => {
+                let num_samples = (sample_rate * (*ms as f32 / 1000.0)) as usize;
+                
+                for _ in 0..num_samples {
+                    current_global_sample += 1;
+                    let mut mixed_sample = 0.0;
+                    
+                    for track in &mut active_tracks {
+                        let mut track_signal = 0.0;
+                        
+                        track.playing_voices.retain_mut(|voice| {
+                            let t = voice.sample_idx as f32 / sample_rate;
+                            
+                            let val = match &voice.sound {
+                                Sound::PianoNote(note) => synth_piano(*note, t),
+                                Sound::PianoChord(chord) => synth_piano_chord(chord, t),
+                                Sound::BassNote(note) => synth_bass(note, t),
+                                Sound::SaxNote(note) => synth_sax(note, t),
+                                Sound::FluteNote(note) => synth_flute(note, voice.sample_idx, t), // <--- [BARU] Route DSP Flute
+                                Sound::DrumBass => synth_kick(voice.sample_idx, t),
+                                Sound::DrumSnare => synth_snare(voice.sample_idx, t),
+                                Sound::AcousticA | Sound::AcousticD => synth_acoustic(&voice.sound, t),
+                                Sound::Sample(name) => {
+                                    project.external_samples.get(name)
+                                        .and_then(|v| v.get(voice.sample_idx).cloned())
+                                        .map(|s| s * 0.35) 
+                                        .unwrap_or(0.0)
+                                }
+                            };
+                            
+                            track_signal += val;
+                            voice.sample_idx += 1;
+                            
+                            let is_finished = match &voice.sound {
+                                Sound::Sample(name) => {
+                                    let len = project.external_samples.get(name).map(|v| v.len()).unwrap_or(0);
+                                    voice.sample_idx >= len
+                                }
+                                Sound::PianoNote(_) => t > 2.0,
+                                Sound::PianoChord(_) => t > 2.5, 
+                                Sound::BassNote(_) => t > 2.5,
+                                Sound::SaxNote(_) => t > 3.0,
+                                Sound::FluteNote(_) => t > 3.0, // <--- [BARU] Durasi pelepasan nafas seruling
+                                Sound::DrumBass => t > 0.4,
+                                Sound::DrumSnare => t > 0.6,
+                                Sound::AcousticA | Sound::AcousticD => t > 2.5,
+                            };
+                            
+                            !is_finished
+                        });
+                        
+                        mixed_sample += track_signal * track.volume;
+                        
+                        if track.pattern.is_empty() { continue; }
+                        
+                        if track.wait_samples > 0 {
+                            track.wait_samples -= 1;
+                        } else if track.event_idx < track.pattern.len() {
+                            let mut loop_detector = 0;
+                            let max_events_per_tick = track.pattern.len() * 2;
+                            
+                            while track.wait_samples == 0 && loop_detector < max_events_per_tick && track.event_idx < track.pattern.len() {
+                                loop_detector += 1;
+                                let current_element = &track.pattern[track.event_idx];
+                                
+                                match current_element {
+                                    PatternElement::Play(sound) => {
+                                        track.playing_voices.push(PlayingVoice {
+                                            sound: sound.clone(),
+                                            sample_idx: 0,
+                                        });
+                                    }
+                                    PatternElement::Wait(samples) => {
+                                        track.wait_samples = *samples;
+                                    }
+                                }
+                                
+                                track.event_idx += 1;
+                                
+                                if track.event_idx >= track.pattern.len() && track.is_looping {
+                                    track.event_idx = 0;
+                                }
+                            }
+                            
+                            if track.wait_samples == 0 && loop_detector >= max_events_per_tick {
+                                track.wait_samples = 1; 
+                            }
+                        }
+                    }
+                    mixed_output.push(mixed_sample);
+                }
+            }
+        }
+    }
+    mixed_output
+}
+
+// ==========================================
+// 5. GLOBAL INTERFACE: SAVE & PLAY
+// ==========================================
+
+pub fn save(samples: &[f32], file_path: &str) {
+    let spec = hound::WavSpec {
+        channels: 1, sample_rate: 44100, bits_per_sample: 16, sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(file_path, spec).unwrap();
+    let volume_factor = (i16::MAX / 5) as f32;
+    for &sample in samples {
+        let clamped = (sample * volume_factor).clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+        writer.write_sample(clamped).unwrap();
+    }
+    writer.finalize().unwrap();
+    println!("[INFO] File '{}' berhasil disimpan.", file_path);
+}
+
+pub fn play(samples: &[f32]) {
+    let handle = DeviceSinkBuilder::open_default_sink().expect("Gagal memanggil sound card");
+    let player = Player::connect_new(&handle.mixer());
+    let play_samples: Vec<f32> = samples.iter().map(|&s| (s * 0.15).clamp(-1.0, 1.0)).collect();
+    let channels = NonZero::new(1u16).unwrap();
+    let sample_rate = NonZero::new(44100u32).unwrap();
+    let audio_source = SamplesBuffer::new(channels, sample_rate, play_samples);
+    player.append(audio_source);
+    player.sleep_until_end();
+}
+
+// ==========================================
+// 6. MACRO DSL
+// ==========================================
+
+#[macro_export]
+macro_rules! parse_drum {
+    ($vec:ident) => {}; ($vec:ident , $($rest:tt)*) => { parse_drum!($vec $($rest)*); };
+    ($vec:ident gap($ms:literal) $($rest:tt)*) => {
+        let samples = (44100.0 * ($ms as f32 / 1000.0)) as usize; $vec.push(PatternElement::Wait(samples)); parse_drum!($vec $($rest)*);
+    };
+    ($vec:ident bass $($rest:tt)*) => { $vec.push(PatternElement::Play(Sound::DrumBass)); parse_drum!($vec $($rest)*); };
+    ($vec:ident snare $($rest:tt)*) => { $vec.push(PatternElement::Play(Sound::DrumSnare)); parse_drum!($vec $($rest)*); };
+    ($vec:ident $custom:ident $($rest:tt)*) => { $vec.push(PatternElement::Play(Sound::Sample(stringify!($custom).to_string()))); parse_drum!($vec $($rest)*); };
+}
+
+#[macro_export]
+macro_rules! parse_piano {
+    ($vec:ident) => {}; ($vec:ident , $($rest:tt)*) => { parse_piano!($vec $($rest)*); };
+    ($vec:ident gap($ms:literal) $($rest:tt)*) => {
+        let samples = (44100.0 * ($ms as f32 / 1000.0)) as usize; $vec.push(PatternElement::Wait(samples)); parse_piano!($vec $($rest)*);
+    };
+    ($vec:ident $note:literal $($rest:tt)*) => { $vec.push(PatternElement::Play(Sound::PianoNote($note))); parse_piano!($vec $($rest)*); };
+    ($vec:ident C $($rest:tt)*) => { $vec.push(PatternElement::Play(Sound::PianoChord("C".to_string()))); parse_piano!($vec $($rest)*); };
+    ($vec:ident C_B $($rest:tt)*) => { $vec.push(PatternElement::Play(Sound::PianoChord("C_B".to_string()))); parse_piano!($vec $($rest)*); };
+    ($vec:ident Dm $($rest:tt)*) => { $vec.push(PatternElement::Play(Sound::PianoChord("Dm".to_string()))); parse_piano!($vec $($rest)*); };
+    ($vec:ident Gsus4 $($rest:tt)*) => { $vec.push(PatternElement::Play(Sound::PianoChord("Gsus4".to_string()))); parse_piano!($vec $($rest)*); };
+    ($vec:ident G $($rest:tt)*) => { $vec.push(PatternElement::Play(Sound::PianoChord("G".to_string()))); parse_piano!($vec $($rest)*); };
+    ($vec:ident Am $($rest:tt)*) => { $vec.push(PatternElement::Play(Sound::PianoChord("Am".to_string()))); parse_piano!($vec $($rest)*); };
+    ($vec:ident Em $($rest:tt)*) => { $vec.push(PatternElement::Play(Sound::PianoChord("Em".to_string()))); parse_piano!($vec $($rest)*); };
+    ($vec:ident F $($rest:tt)*) => { $vec.push(PatternElement::Play(Sound::PianoChord("F".to_string()))); parse_piano!($vec $($rest)*); };
+    ($vec:ident C_E $($rest:tt)*) => { $vec.push(PatternElement::Play(Sound::PianoChord("C_E".to_string()))); parse_piano!($vec $($rest)*); };
+    ($vec:ident $custom:ident $($rest:tt)*) => { $vec.push(PatternElement::Play(Sound::Sample(stringify!($custom).to_string()))); parse_piano!($vec $($rest)*); };
+}
+
+#[macro_export]
+macro_rules! parse_bass {
+    ($vec:ident) => {}; ($vec:ident , $($rest:tt)*) => { parse_bass!($vec $($rest)*); };
+    ($vec:ident gap($ms:literal) $($rest:tt)*) => {
+        let samples = (44100.0 * ($ms as f32 / 1000.0)) as usize; $vec.push(PatternElement::Wait(samples)); parse_bass!($vec $($rest)*);
+    };
+    ($vec:ident C $($rest:tt)*) => { $vec.push(PatternElement::Play(Sound::BassNote("C".to_string()))); parse_bass!($vec $($rest)*); };
+    ($vec:ident D $($rest:tt)*) => { $vec.push(PatternElement::Play(Sound::BassNote("D".to_string()))); parse_bass!($vec $($rest)*); };
+    ($vec:ident E $($rest:tt)*) => { $vec.push(PatternElement::Play(Sound::BassNote("E".to_string()))); parse_bass!($vec $($rest)*); };
+    ($vec:ident F $($rest:tt)*) => { $vec.push(PatternElement::Play(Sound::BassNote("F".to_string()))); parse_bass!($vec $($rest)*); };
+    ($vec:ident G $($rest:tt)*) => { $vec.push(PatternElement::Play(Sound::BassNote("G".to_string()))); parse_bass!($vec $($rest)*); };
+    ($vec:ident A $($rest:tt)*) => { $vec.push(PatternElement::Play(Sound::BassNote("A".to_string()))); parse_bass!($vec $($rest)*); };
+    ($vec:ident B $($rest:tt)*) => { $vec.push(PatternElement::Play(Sound::BassNote("B".to_string()))); parse_bass!($vec $($rest)*); };
+    ($vec:ident $custom:ident $($rest:tt)*) => { $vec.push(PatternElement::Play(Sound::Sample(stringify!($custom).to_string()))); parse_bass!($vec $($rest)*); };
+}
+
+#[macro_export]
+macro_rules! parse_sax {
+    ($vec:ident) => {}; ($vec:ident , $($rest:tt)*) => { parse_sax!($vec $($rest)*); };
+    ($vec:ident gap($ms:literal) $($rest:tt)*) => {
+        let samples = (44100.0 * ($ms as f32 / 1000.0)) as usize; $vec.push(PatternElement::Wait(samples)); parse_sax!($vec $($rest)*);
+    };
+    ($vec:ident C $($rest:tt)*) => { $vec.push(PatternElement::Play(Sound::SaxNote("C".to_string()))); parse_sax!($vec $($rest)*); };
+    ($vec:ident D $($rest:tt)*) => { $vec.push(PatternElement::Play(Sound::SaxNote("D".to_string()))); parse_sax!($vec $($rest)*); };
+    ($vec:ident E $($rest:tt)*) => { $vec.push(PatternElement::Play(Sound::SaxNote("E".to_string()))); parse_sax!($vec $($rest)*); };
+    ($vec:ident F $($rest:tt)*) => { $vec.push(PatternElement::Play(Sound::SaxNote("F".to_string()))); parse_sax!($vec $($rest)*); };
+    ($vec:ident G $($rest:tt)*) => { $vec.push(PatternElement::Play(Sound::SaxNote("G".to_string()))); parse_sax!($vec $($rest)*); };
+    ($vec:ident A $($rest:tt)*) => { $vec.push(PatternElement::Play(Sound::SaxNote("A".to_string()))); parse_sax!($vec $($rest)*); };
+    ($vec:ident B $($rest:tt)*) => { $vec.push(PatternElement::Play(Sound::SaxNote("B".to_string()))); parse_sax!($vec $($rest)*); };
+    ($vec:ident $custom:ident $($rest:tt)*) => { $vec.push(PatternElement::Play(Sound::Sample(stringify!($custom).to_string()))); parse_sax!($vec $($rest)*); };
+}
+
+// <--- [BARU] Macro Parser untuk nada Seruling/Flute
+#[macro_export]
+macro_rules! parse_flute {
+    ($vec:ident) => {}; ($vec:ident , $($rest:tt)*) => { parse_flute!($vec $($rest)*); };
+    ($vec:ident gap($ms:literal) $($rest:tt)*) => {
+        let samples = (44100.0 * ($ms as f32 / 1000.0)) as usize; $vec.push(PatternElement::Wait(samples)); parse_flute!($vec $($rest)*);
+    };
+    ($vec:ident C $($rest:tt)*) => { $vec.push(PatternElement::Play(Sound::FluteNote("C".to_string()))); parse_flute!($vec $($rest)*); };
+    ($vec:ident D $($rest:tt)*) => { $vec.push(PatternElement::Play(Sound::FluteNote("D".to_string()))); parse_flute!($vec $($rest)*); };
+    ($vec:ident E $($rest:tt)*) => { $vec.push(PatternElement::Play(Sound::FluteNote("E".to_string()))); parse_flute!($vec $($rest)*); };
+    ($vec:ident F $($rest:tt)*) => { $vec.push(PatternElement::Play(Sound::FluteNote("F".to_string()))); parse_flute!($vec $($rest)*); };
+    ($vec:ident G $($rest:tt)*) => { $vec.push(PatternElement::Play(Sound::FluteNote("G".to_string()))); parse_flute!($vec $($rest)*); };
+    ($vec:ident A $($rest:tt)*) => { $vec.push(PatternElement::Play(Sound::FluteNote("A".to_string()))); parse_flute!($vec $($rest)*); };
+    ($vec:ident B $($rest:tt)*) => { $vec.push(PatternElement::Play(Sound::FluteNote("B".to_string()))); parse_flute!($vec $($rest)*); };
+    ($vec:ident $custom:ident $($rest:tt)*) => { $vec.push(PatternElement::Play(Sound::Sample(stringify!($custom).to_string()))); parse_flute!($vec $($rest)*); };
+}
+
+#[macro_export]
+macro_rules! parse_acoustic {
+    ($vec:ident) => {}; ($vec:ident , $($rest:tt)*) => { parse_acoustic!($vec $($rest)*); };
+    ($vec:ident gap($ms:literal) $($rest:tt)*) => {
+        let samples = (44100.0 * ($ms as f32 / 1000.0)) as usize; $vec.push(PatternElement::Wait(samples)); parse_acoustic!($vec $($rest)*);
+    };
+    ($vec:ident a $($rest:tt)*) => { $vec.push(PatternElement::Play(Sound::AcousticA)); parse_acoustic!($vec $($rest)*); };
+    ($vec:ident d $($rest:tt)*) => { $vec.push(PatternElement::Play(Sound::AcousticD)); parse_acoustic!($vec $($rest)*); };
+    ($vec:ident $custom:ident $($rest:tt)*) => { $vec.push(PatternElement::Play(Sound::Sample(stringify!($custom).to_string()))); parse_acoustic!($vec $($rest)*); };
+}
+
+#[macro_export]
+macro_rules! parse_drum_loops {
+    ($project:ident $id:ident => { volume: $vol:tt, loop { $($body:tt)* } } $($rest:tt)*) => {
+        let mut pattern = Vec::new(); parse_drum!(pattern $($body)*); $project.add_pattern("drum", stringify!($id), pattern, if stringify!($vol) == "equal" {1.0} else {(stringify!($vol).parse::<f32>().unwrap_or(100.0) / 100.0)}, true); parse_drum_loops!($project $($rest)*);
+    };
+    ($project:ident $id:ident => { volume: $vol:tt, once { $($body:tt)* } } $($rest:tt)*) => {
+        let mut pattern = Vec::new(); parse_drum!(pattern $($body)*); $project.add_pattern("drum", stringify!($id), pattern, if stringify!($vol) == "equal" {1.0} else {(stringify!($vol).parse::<f32>().unwrap_or(100.0) / 100.0)}, false); parse_drum_loops!($project $($rest)*);
+    };
+    ($project:ident) => {}; ($project:ident , $($rest:tt)*) => { parse_drum_loops!($project $($rest)*); };
+}
+
+#[macro_export]
+macro_rules! parse_piano_loops {
+    ($project:ident $id:ident => { volume: $vol:tt, loop { $($body:tt)* } } $($rest:tt)*) => {
+        let mut pattern = Vec::new(); parse_piano!(pattern $($body)*); $project.add_pattern("piano", stringify!($id), pattern, if stringify!($vol) == "equal" {1.0} else {(stringify!($vol).parse::<f32>().unwrap_or(100.0) / 100.0)}, true); parse_piano_loops!($project $($rest)*);
+    };
+    ($project:ident $id:ident => { volume: $vol:tt, once { $($body:tt)* } } $($rest:tt)*) => {
+        let mut pattern = Vec::new(); parse_piano!(pattern $($body)*); $project.add_pattern("piano", stringify!($id), pattern, if stringify!($vol) == "equal" {1.0} else {(stringify!($vol).parse::<f32>().unwrap_or(100.0) / 100.0)}, false); parse_piano_loops!($project $($rest)*);
+    };
+    ($project:ident) => {}; ($project:ident , $($rest:tt)*) => { parse_piano_loops!($project $($rest)*); };
+}
+
+#[macro_export]
+macro_rules! parse_bass_loops {
+    ($project:ident $id:ident => { volume: $vol:tt, loop { $($body:tt)* } } $($rest:tt)*) => {
+        let mut pattern = Vec::new(); parse_bass!(pattern $($body)*); $project.add_pattern("bass", stringify!($id), pattern, if stringify!($vol) == "equal" {1.0} else {(stringify!($vol).parse::<f32>().unwrap_or(100.0) / 100.0)}, true); parse_bass_loops!($project $($rest)*);
+    };
+    ($project:ident $id:ident => { volume: $vol:tt, once { $($body:tt)* } } $($rest:tt)*) => {
+        let mut pattern = Vec::new(); parse_bass!(pattern $($body)*); $project.add_pattern("bass", stringify!($id), pattern, if stringify!($vol) == "equal" {1.0} else {(stringify!($vol).parse::<f32>().unwrap_or(100.0) / 100.0)}, false); parse_bass_loops!($project $($rest)*);
+    };
+    ($project:ident) => {}; ($project:ident , $($rest:tt)*) => { parse_bass_loops!($project $($rest)*); };
+}
+
+#[macro_export]
+macro_rules! parse_sax_loops {
+    ($project:ident $id:ident => { volume: $vol:tt, loop { $($body:tt)* } } $($rest:tt)*) => {
+        let mut pattern = Vec::new(); parse_sax!(pattern $($body)*); $project.add_pattern("sax", stringify!($id), pattern, if stringify!($vol) == "equal" {1.0} else {(stringify!($vol).parse::<f32>().unwrap_or(100.0) / 100.0)}, true); parse_sax_loops!($project $($rest)*);
+    };
+    ($project:ident $id:ident => { volume: $vol:tt, once { $($body:tt)* } } $($rest:tt)*) => {
+        let mut pattern = Vec::new(); parse_sax!(pattern $($body)*); $project.add_pattern("sax", stringify!($id), pattern, if stringify!($vol) == "equal" {1.0} else {(stringify!($vol).parse::<f32>().unwrap_or(100.0) / 100.0)}, false); parse_sax_loops!($project $($rest)*);
+    };
+    ($project:ident) => {}; ($project:ident , $($rest:tt)*) => { parse_sax_loops!($project $($rest)*); };
+}
+
+// <--- [BARU] Macro Loops untuk Seruling/Flute
+#[macro_export]
+macro_rules! parse_flute_loops {
+    ($project:ident $id:ident => { volume: $vol:tt, loop { $($body:tt)* } } $($rest:tt)*) => {
+        let mut pattern = Vec::new(); parse_flute!(pattern $($body)*); $project.add_pattern("flute", stringify!($id), pattern, if stringify!($vol) == "equal" {1.0} else {(stringify!($vol).parse::<f32>().unwrap_or(100.0) / 100.0)}, true); parse_flute_loops!($project $($rest)*);
+    };
+    ($project:ident $id:ident => { volume: $vol:tt, once { $($body:tt)* } } $($rest:tt)*) => {
+        let mut pattern = Vec::new(); parse_flute!(pattern $($body)*); $project.add_pattern("flute", stringify!($id), pattern, if stringify!($vol) == "equal" {1.0} else {(stringify!($vol).parse::<f32>().unwrap_or(100.0) / 100.0)}, false); parse_flute_loops!($project $($rest)*);
+    };
+    ($project:ident) => {}; ($project:ident , $($rest:tt)*) => { parse_flute_loops!($project $($rest)*); };
+}
+
+#[macro_export]
+macro_rules! parse_acoustic_loops {
+    ($project:ident $id:ident => { volume: $vol:tt, loop { $($body:tt)* } } $($rest:tt)*) => {
+        let mut pattern = Vec::new(); parse_acoustic!(pattern $($body)*); $project.add_pattern("acouistic", stringify!($id), pattern, if stringify!($vol) == "equal" {1.0} else {(stringify!($vol).parse::<f32>().unwrap_or(100.0) / 100.0)}, true); parse_acoustic_loops!($project $($rest)*);
+    };
+    ($project:ident $id:ident => { volume: $vol:tt, once { $($body:tt)* } } $($rest:tt)*) => {
+        let mut pattern = Vec::new(); parse_acoustic!(pattern $($body)*); $project.add_pattern("acouistic", stringify!($id), pattern, if stringify!($vol) == "equal" {1.0} else {(stringify!($vol).parse::<f32>().unwrap_or(100.0) / 100.0)}, false); parse_acoustic_loops!($project $($rest)*);
+    };
+    ($project:ident) => {}; ($project:ident , $($rest:tt)*) => { parse_acoustic_loops!($project $($rest)*); };
+}
+
+#[macro_export]
+macro_rules! audio_impl {
+    ($project:ident) => {}; ($project:ident , $($rest:tt)*) => { audio_impl!($project $($rest)*); };
+    ($project:ident $sample_name:ident = read($path:literal) , $($rest:tt)*) => {
+        $project.load_external_sample(stringify!($sample_name), $path); audio_impl!($project $($rest)*); 
+    };
+    ($project:ident drum { $($body:tt)* } $($rest:tt)*) => { parse_drum_loops!($project $($body)*); audio_impl!($project $($rest)*); };
+    ($project:ident piano { $($body:tt)* } $($rest:tt)*) => { parse_piano_loops!($project $($body)*); audio_impl!($project $($rest)*); };
+    ($project:ident bass { $($body:tt)* } $($rest:tt)*) => { parse_bass_loops!($project $($body)*); audio_impl!($project $($rest)*); };
+    ($project:ident sax { $($body:tt)* } $($rest:tt)*) => { parse_sax_loops!($project $($body)*); audio_impl!($project $($rest)*); };
+    // <--- [BARU] Blok integrasi seruling ke dalam engine utama
+    ($project:ident flute { $($body:tt)* } $($rest:tt)*) => { parse_flute_loops!($project $($body)*); audio_impl!($project $($rest)*); };
+    ($project:ident acouistic { $($body:tt)* } $($rest:tt)*) => { parse_acoustic_loops!($project $($body)*); audio_impl!($project $($rest)*); };
+    ($project:ident start ( $($body:tt)* ) $($rest:tt)*) => { parse_start_pairs!($project $($body)*); audio_impl!($project $($rest)*); };
+    ($project:ident stop ( $($body:tt)* ) $($rest:tt)*) => { parse_stop_pairs!($project $($body)*); audio_impl!($project $($rest)*); };
+    ($project:ident gap($ms:literal) $($rest:tt)*) => { $project.add_command(Command::Gap($ms)); audio_impl!($project $($rest)*); };
+}
+
+#[macro_export]
+macro_rules! parse_start_pairs {
+    ($project:ident $inst:ident => $id:ident $($rest:tt)*) => {
+        $project.add_command(Command::Start(stringify!($inst).to_string(), stringify!($id).to_string())); parse_start_pairs!($project $($rest)*);
+    };
+    ($project:ident) => {}; ($project:ident , $($rest:tt)*) => { parse_start_pairs!($project $($rest)*); };
+}
+
+#[macro_export]
+macro_rules! parse_stop_pairs {
+    ($project:ident $inst:ident => $id:ident $($rest:tt)*) => {
+        $project.add_command(Command::Stop(stringify!($inst).to_string(), stringify!($id).to_string())); parse_stop_pairs!($project $($rest)*);
+    };
+    ($project:ident) => {}; ($project:ident , $($rest:tt)*) => { parse_stop_pairs!($project $($rest)*); };
+}
+
+#[macro_export]
+macro_rules! audio {
+    ($name:ident, { $($body:tt)* }) => {
+        let mut project = Project::new(); audio_impl!(project $($body)*); let $name = render_project(&project);
+    };
+}

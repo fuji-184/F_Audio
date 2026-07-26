@@ -1,0 +1,9 @@
+[package]
+name = "tes"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+f_audio = { version = "0.1.0", path = ".." }
+hound = "3.5.1"
+rodio = "0.22.2"
