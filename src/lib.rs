@@ -433,7 +433,12 @@ impl Project {
         Instrument::Sax => (synth::synth_sax_note(token, total_ms, sr), 1),
         Instrument::Flute => (synth::synth_flute_note(token, total_ms, sr), 1),
         Instrument::Bass => (synth::synth_bass_note(token, total_ms, sr), 1),
+        
+        Instrument::Guitar if preset == "acoustic_single" => {
+            (synth::synth_guitar_single_note_stereo(token, total_ms, sr), 2)
+        },
         Instrument::Guitar => (synth::synth_guitar_chord_stereo(token, total_ms, sr, preset), 2),
+
     };
 
         // Fade out

@@ -793,6 +793,7 @@ pub fn synth_flute_note(token: &str, duration_ms: u64, sample_rate: u32) -> Vec<
 }
 
 
+
 // ====================================================================
 // BASS GUITAR — True Heavy HiFi Cabinet Edition
 // Single KS · Pick Scrape · Cabinet Resonance · Speaker Clip
@@ -819,29 +820,22 @@ pub fn synth_bass_note(token: &str, duration_ms: u64, sample_rate: u32) -> Vec<f
     
     for i in 0..dl_len {
         let t = i as f32 / sample_rate as f32;
-        
-        // Pick Scrape (Inharmonik)
-        let pick_scrape = (
-            (2.0 * PI * 1543.0 * t).sin() + 
-            (2.0 * PI * 3891.0 * t).sin() + 
-            (2.0 * PI * 5127.0 * t).sin() + 
-            (2.0 * PI * 7231.0 * t).sin()
-        ) * (-t / 0.003).exp() * 0.20;
 
-        // String Thump
+        // String Thump — lembut, tanpa pick scrape inharmonik
+        // Dikurangi gain dari 0.9 -> 0.45 agar attack tidak "pluck" keras
         let thump = (
             (2.0 * PI * f0 * t).sin() + 
-            0.6 * (4.0 * PI * f0 * t).sin()
-        ) * (-t / 0.008).exp() * 0.9;
+            0.4 * (4.0 * PI * f0 * t).sin()
+        ) * (-t / 0.006).exp() * 0.45;
 
-        // Sustain Seed
+        // Sustain Seed — sumber nada utama KS loop
         let seed = (
             (2.0 * PI * f0 * t).sin() + 
             0.25 * (4.0 * PI * f0 * t).sin() + 
             0.15 * (6.0 * PI * f0 * t).sin()
         ) * 0.5;
 
-        dl[i] = pick_scrape + thump + seed;
+        dl[i] = thump + seed;
     }
 
     let ks_c   = 0.4992f32;
@@ -878,20 +872,15 @@ pub fn synth_bass_note(token: &str, duration_ms: u64, sample_rate: u32) -> Vec<f
     // 4. Sub Low-Pass
     let mut sub_lp = LowPassBiquad::new((sub_f0 * 3.5).min(100.0), 0.70, sample_rate);
 
-    // 5. Global High-Pass (Turunkan ke 35Hz biar sub tetap nendang dada)
+    // 5. Global High-Pass (35Hz agar sub tetap penuh)
     let hp_a = 1.0 - (-2.0 * PI * 35.0 / sample_rate as f32).exp();
     let mut hp_s = 0.0f32;
-    
-    // 6. Pick High-Pass
-    let pick_hp_a = 1.0 - (-2.0 * PI * 1200.0 / sample_rate as f32).exp();
-    let mut pick_hp_s = 0.0f32;
 
-    let growl_drive = 4.5f32;
-    let body_drive   = 2.0f32;
+    let growl_drive = 3.0f32;  // dikurangi dari 4.5 agar lebih halus
+    let body_drive   = 1.6f32; // dikurangi dari 2.0
 
     let growl_delay_n = ms_to_samples(40, sample_rate);
     let growl_fade_n  = ms_to_samples(150, sample_rate) as f32;
-    let pick_decay_len = ms_to_samples(35, sample_rate) as f32;
 
     // ================================================================
     // MAIN LOOP
@@ -916,29 +905,19 @@ pub fn synth_bass_note(token: &str, duration_ms: u64, sample_rate: u32) -> Vec<f
         let oct_hint = up_raw * 0.03 * env[i];
 
         // ══════════════════════════════════════════
-        //  1. CABINET RESONANCE (Rumah dari "Heavy")
-        //  Menangkap sinyal <120Hz, lalu menumpuknya ke sinyal asli
-        //  Ini mensimulasikan efek resonansi kayu amp bass.
+        //  1. CABINET RESONANCE — sub body resonance ringan
         // ══════════════════════════════════════════
         let cab_rumble = cab_lp.process(filtered);
-        let resonated_signal = filtered + (cab_rumble * 0.6); // Boost sub body
+        let resonated_signal = filtered + (cab_rumble * 0.35); // dikurangi dari 0.6
 
         // ══════════════════════════════════════════
-        //  2. PICK ATTACK (Diturunkan sedikit, fokus ke "thump" bukan "zing")
-        // ══════════════════════════════════════════
-        pick_hp_s += pick_hp_a * (resonated_signal - pick_hp_s);
-        let pick_signal = resonated_signal - pick_hp_s; 
-        let pick_env = (-(i as f32) / pick_decay_len).exp();
-        let pick_final = pick_signal * pick_env * 0.45; // Turunkan dari 0.7 -> 0.45
-
-        // ══════════════════════════════════════════
-        //  3. BODY PATH (Naikkan level & warmth)
+        //  2. BODY PATH — warmth utama
         // ══════════════════════════════════════════
         let body_filt = body_lp.process(resonated_signal);
-        let body = (body_filt * body_drive).tanh() / body_drive * 0.95; // Naikkan dari 0.8 -> 0.95
+        let body = (body_filt * body_drive).tanh() / body_drive * 0.80;
 
         // ══════════════════════════════════════════
-        //  4. GROWL PATH (Lebih halus, mengisi mid)
+        //  3. GROWL PATH — mid karakter, muncul lambat
         // ══════════════════════════════════════════
         let growl_factor = if i > growl_delay_n {
             let t = (i - growl_delay_n) as f32 / growl_fade_n;
@@ -946,33 +925,21 @@ pub fn synth_bass_note(token: &str, duration_ms: u64, sample_rate: u32) -> Vec<f
         } else {
             0.0
         };
-        
         let g_raw = growl_bp.process(resonated_signal);
         let g_sat = (g_raw * growl_drive).tanh() / growl_drive;
-        let growl = g_sat * 0.45 * growl_factor;
+        let growl = g_sat * 0.30 * growl_factor;
 
         // ══════════════════════════════════════════
-        //  FINAL MIX
+        //  FINAL MIX — tanpa pick path
         // ══════════════════════════════════════════
-        let mixed = pick_final + body + growl + sub + oct_hint;
+        let mixed = body + growl + sub + oct_hint;
 
         hp_s += hp_a * (mixed - hp_s);
         let clean = mixed - hp_s;
 
-        // ══════════════════════════════════════════
-        //  ASYMMETRICAL SPEAKER CLIPPING (Dinamis & Hifi)
-        //  Speaker bass dorong ke luar (positif) lebih mudah,
-        //  tarik ke dalam (negatif) lebih keras/resisten.
-        //  Ini menghasilkan punch yang keras tapi tidak nyaring tipis.
-        // ══════════════════════════════════════════
-        let amp_in = clean * env[i] * 1.35; 
-        let pos = amp_in.max(0.0);
-        let neg = amp_in.min(0.0);
-        
-        // Clip positif lebih lunak, Clip negatif lebih ketat
-        let clipped = (pos / (1.0 + pos)) + (neg / (1.0 + neg.abs() * 1.4));
-
-        out[i] = clipped;
+        // Soft clip simetris — lebih bersih, tanpa karakter "pick zing"
+        let amp_in = clean * env[i] * 1.05; // dikurangi dari 1.35
+        out[i] = amp_in.tanh();
     }
 
     // DC offset removal
@@ -991,6 +958,7 @@ pub fn synth_bass_chord(token: &str, duration_ms: u64, sample_rate: u32) -> Vec<
     synth_bass_note(token, duration_ms, sample_rate)
 }
 
+    
 // ====================================================================
 // MULTI-PRESET GUITAR SYNTHESIZER (Ultra-Realistic Acoustic)
 // PERBAIKAN FISIK: Inharmonicity, Dynamic Damping, Pick Transient
@@ -1381,4 +1349,61 @@ fn apply_electric_body(buffer: &mut [f32], sr: u32) {
 
 
 // Tidak dipakai tapi tetap di-export untuk kompatibilitas
+
+
+// ============================================================
+// KODE TAMBAHAN: GITAR AKUSTIK PETIKAN SATU PER SATU
+// Paste ke file masing-masing sesuai panduan di bawah
+// ============================================================
+
+
+// ============================================================
+// [FILE 1] src/synth.rs
+// Paste di bagian PALING BAWAH file (setelah baris terakhir)
+// ============================================================
+
+/// Gitar akustik petikan satu senar — Karplus-Strong dengan karakter
+/// petikan jari/plektrum, sustain natural, dan resonansi body kayu.
+/// Menghasilkan output stereo interleaved (sama seperti synth_guitar_chord_stereo).
+pub fn synth_guitar_single_note_stereo(
+    token: &str,
+    duration_ms: u64,
+    sample_rate: u32,
+) -> Vec<f32> {
+    // Mapping angka 1-8 ke not dalam oktaf 3 (range gitar akustik standar)
+    let mapped = match token.trim() {
+        "1" => "C3",
+        "2" => "D3",
+        "3" => "E3",
+        "4" => "F3",
+        "5" => "G3",
+        "6" => "A3",
+        "7" => "B3",
+        "8" => "C4",
+        other => other,
+    };
+
+    let f0 = crate::notes::single_note_freq(mapped, 3);
+    let dur = duration_ms.max(300);
+
+    // Kiri dan kanan pakai seed berbeda untuk efek stereo alami
+    let mut left  = engine_pure_acoustic_string(f0, dur, sample_rate, 0, 0x00000000);
+    let mut right = engine_pure_acoustic_string(f0, dur, sample_rate, 0, 0x0000DEAD);
+
+    // Body resonansi kayu pada kedua channel
+    apply_acoustic_wooden_body(&mut left,  sample_rate);
+    apply_acoustic_wooden_body(&mut right, sample_rate);
+
+    // Normalisasi peak agar tidak clipping
+    let peak = left.iter().chain(right.iter())
+        .map(|s| s.abs())
+        .fold(0.0f32, f32::max);
+    if peak > 0.88 {
+        let scale = 0.88 / peak;
+        for s in left.iter_mut()  { *s *= scale; }
+        for s in right.iter_mut() { *s *= scale; }
+    }
+
+    crate::dsp::interleave_stereo(left, right)
+}
 
