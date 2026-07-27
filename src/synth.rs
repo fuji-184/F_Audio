@@ -1,11 +1,5 @@
 
 
-//! Mesin sintesis suara per-instrumen — versi Clean HiFi
-//! Piano: additive murni tanpa noise, harmonik presisi
-//! Saxophone: reed oscillator jernih tanpa desis
-//! Acoustic Guitar: Karplus-Strong klasik yang bersih
-//! Flute: sinusoidal murni, breath minimal hanya di attack awal
-
 use crate::dsp::{
     adsr_envelope, ms_to_samples, BandPass, LowPassBiquad,
     OnePoleHighPass, OnePoleLowPass, Rng, HighShelf, interleave_stereo
@@ -166,64 +160,7 @@ fn synth_snare(sr: u32) -> Vec<f32> {
     out
 }
 
-/*
-// ─── HIHAT CLOSED (natural & crispy) ─────────────────────
-fn synth_hihat(sr: u32) -> Vec<f32> {
-    let n = ms_to_samples(120, sr);  // sedikit lebih pendek
-    let mut out = vec![0.0f32; n];
-    let mut rng = Rng::new(0xC0FFEE);
 
-    let mut nbp1 = BandPass::new(7200.0,  0.9, sr);
-    let mut nbp2 = BandPass::new(10500.0, 0.8, sr);
-    let mut n_rolloff = LowPassBiquad::new(14500.0, 0.7, sr);
-
-    // Kurangi jumlah osilator, frekuensi lebih acak & rendah
-    let mut c: Vec<f32> = vec![0.0; 5];
-    let cf = [3900.0, 5100.0, 6300.0, 7800.0, 9200.0];
-    let mut clang_lp = LowPassBiquad::new(11500.0, 0.7, sr);
-
-    // Stick click pendek untuk crispness
-    let mut stick_bp = BandPass::new(5600.0, 0.5, sr);
-    let mut stick_lp = LowPassBiquad::new(9500.0, 0.7, sr);
-
-    for (i, slot) in out.iter_mut().enumerate() {
-        let t = i as f32 / sr as f32;
-        let noise = (rng.next_f32() - 0.5) * 2.0;
-
-        for (k, freq) in cf.iter().enumerate() {
-            c[k] += 2.0 * PI * freq / sr as f32;
-        }
-
-        // Noise sizzle
-        let n_env = (-t / 0.002).exp() * 0.20 + (-t / 0.025).exp() * 0.80;
-        let n_raw = nbp1.process(noise) * 0.45 + nbp2.process(noise) * 0.45;
-        let noise_out = n_rolloff.process(n_raw) * n_env * 0.38;
-
-        // Clang dengan drive lebih rendah
-        let attack_noise = nbp1.process(noise) * (-t / 0.0025).exp() * 0.60;
-        let clang_sum: f32 = c.iter().enumerate().map(|(k, &phase)| {
-            let env = [0.012, 0.010, 0.014, 0.008, 0.006][k];
-            phase.sin() * (-t / env).exp() * [0.28, 0.22, 0.18, 0.12, 0.08][k]
-        }).sum();
-        let clang = clang_lp.process(membrane((clang_sum + attack_noise) * 1.8)) * 0.48;
-
-        // Stick click sangat pendek
-        let stick = stick_lp.process(stick_bp.process(noise)) * (-t / 0.002).exp() * 0.25;
-
-        // Choke pedal
-        let choke = if t > 0.070 { (-(t - 0.070) / 0.012).exp().max(0.0) } else { 1.0 };
-
-        *slot = (noise_out + clang + stick) * 0.85 * choke;
-    }
-    
-    for s in out.iter_mut() {
-        if s.abs() < 1e-25 { *s = 0.0; }
-    }
-    
-    out
-}
-
-*/
 
 fn synth_hihat(sr: u32) -> Vec<f32> {
     let n = ms_to_samples(120, sr);
@@ -1063,40 +1000,6 @@ pub fn synth_guitar_chord_stereo(token: &str, duration_ms: u64, sample_rate: u32
 
     interleave_stereo(left_chord, right_chord)
 }
-
-/*
-pub fn synth_guitar_note(token: &str, duration_ms: u64, sample_rate: u32, preset: &str) -> Vec<f32> {
-    let mapped_token = match token.trim() {
-        "1" => "C3", "2" => "D3", "3" => "E3", "4" => "F3",
-        "5" => "G3", "6" => "A3", "7" => "B3", "8" => "C4",
-        other => other,
-    };
-    let f0  = single_note_freq(mapped_token, 3);
-    let dur = duration_ms.max(650);
-
-    let mut out = if preset == "electric 1" {
-        engine_electric_string(f0, dur, sample_rate, 0)
-    } else {
-        engine_pure_acoustic_string(f0, dur, sample_rate, 0)
-    };
-
-    if preset == "electric 1" {
-        apply_electric_body(&mut out, sample_rate);
-    } else {
-        apply_acoustic_wooden_body(&mut out, sample_rate);
-    }
-
-    let max_peak = out.iter().map(|s| s.abs()).fold(0.0f32, |a, b| a.max(b));
-    if max_peak > 0.88 {
-        let scale = 0.88 / max_peak;
-        for s in out.iter_mut() {
-            *s *= scale;
-        }
-    }
-
-    out
-}
-*/
 
 // ====================================================================
 // HELPERS

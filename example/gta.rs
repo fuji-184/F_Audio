@@ -544,8 +544,8 @@ fn main() {
 
         guitar {
             riff => {
-                volume: 70,
-                preset: "acoustic_single",
+                volume: 75,
+                preset: "electric 1",
                 once {
                     gap(1895),
                     "Bb4", long(156),
@@ -655,8 +655,8 @@ fn main() {
                 }
             },
             riff2 => {
-                volume: 67,
-                preset: "acoustic_single",
+                volume: 72,
+                preset: "electric 1",
                 once {
                     gap(48000),
                     "G3", long(315),
@@ -1061,7 +1061,7 @@ fn main() {
 
         sax {
             violin => {
-                volume: 95,
+                volume: 80,
                 once {
                     gap(10105),
                     "D5", long(2525),
@@ -1081,7 +1081,7 @@ fn main() {
                 }
             },
             cello => {
-                volume: 90,
+                volume: 75,
                 once {
                     gap(11368),
                     "G4", long(1262),
@@ -1492,8 +1492,8 @@ fn main() {
         stop(flute  => sfx)
     });
 
-    println!("[INFO] Menyimpan ke gta_sa_theme.wav...");
-    save(&lagu, "gta.wav");
+    println!("[INFO] Menyimpan ke gta.wav...");
+    save(&lagu, "gta_sa_theme.wav");
     play(&lagu);
     println!("[INFO] Selesai!");
 }
