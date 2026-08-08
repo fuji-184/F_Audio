@@ -123,6 +123,8 @@ pub enum Instrument {
     Flute,
     Bass,    
     Guitar,  
+    Violin,
+    Viola
 }
 
 impl Instrument {
@@ -134,6 +136,8 @@ impl Instrument {
             "flute" => Instrument::Flute,
             "bass" | "bass_guitar" | "bassguitar" => Instrument::Bass,
             "guitar" | "elec_guitar" | "distortion" | "heavy_guitar" => Instrument::Guitar,
+            "violin" | "fiddle" => Instrument::Violin,
+            "viola" => Instrument::Viola,
             other => panic!("[f_audio] Instrumen tidak dikenal: '{}'\nInstrumen yang tersedia: drum, piano, sax, flute, bass, guitar", other),
         }
     }
@@ -159,6 +163,8 @@ impl Instrument {
             Instrument::Flute => (0.50, 0.50),   // flute setengah lebar
             Instrument::Bass  => (0.50, 0.00),   // bass mono total
             Instrument::Guitar => (0.50, 0.65),  // gitar cukup lebar
+            Instrument::Violin => (0.50, 0.60),  // violin agak lebar, natural
+            Instrument::Viola  => (0.50, 0.55),  // viola sedikit lebih narrow dari violin
         }
     }
     
@@ -415,6 +421,8 @@ impl Project {
             Instrument::Piano => 1500,
             Instrument::Guitar => 600,
             Instrument::Bass => 300,
+            Instrument::Violin => 120,
+            Instrument::Viola  => 120,
             _ => 200,
         };
 
@@ -438,6 +446,8 @@ impl Project {
             (synth::synth_guitar_single_note_stereo(token, total_ms, sr), 2)
         },
         Instrument::Guitar => (synth::synth_guitar_chord_stereo(token, total_ms, sr, preset), 2),
+        Instrument::Violin => (synth::synth_violin_note(token, total_ms, sr), 2),
+        Instrument::Viola  => (synth::synth_viola_note(token, total_ms, sr), 2),
 
     };
 

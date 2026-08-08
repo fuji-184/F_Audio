@@ -1310,3 +1310,470 @@ pub fn synth_guitar_single_note_stereo(
     crate::dsp::interleave_stereo(left, right)
 }
 
+
+
+// ====================================================================
+// VIOLIN — Luxury Bowed String Synthesizer
+//
+// Arsitektur:
+//   1. Helmholtz Slip-Stick oscillator (bow-string physics)
+//   2. 18 partials additive + inharmonicity stretch
+//   3. Dual-layer body resonance (Stradivari-style formants)
+//   4. Expressive vibrato dengan attack curve organik
+//   5. True stereo output (L/R dengan seed berbeda)
+//   6. Rosin scrape & bow change transient di onset
+// ====================================================================
+
+/// Satu suara violin monophonic dengan model fisik bowed string.
+/// Output: stereo interleaved (sama dengan guitar/drum).
+use crate::dsp;
+pub fn synth_violin_note(token: &str, duration_ms: u64, sample_rate: u32) -> Vec<f32> {
+    let f0  = single_note_freq(token, 5);
+    if f0 < 1.0 { return vec![0.0; dsp::ms_to_samples(duration_ms, sample_rate) * 2]; }
+
+    let left  = violin_mono_voice(f0, duration_ms, sample_rate, 0x5A7E_B0ED);
+    let mut right = violin_mono_voice(f0, duration_ms, sample_rate, 0xDEAD_CAFE);
+
+    // Chorus stereoiser: kanan di-detune sangat halus untuk kesan ruang
+    let detune = 1.0 + 0.00018f32; // +0.18 sen
+    for (i, s) in right.iter_mut().enumerate() {
+        let lfo = (2.0 * PI * 0.31 * i as f32 / sample_rate as f32).sin() * 0.000055;
+        *s *= 1.0 + lfo;
+        let _ = detune; // digunakan lewat lfo saja
+    }
+
+    // Peak normalize bersama agar tidak clipping
+    let peak = left.iter().chain(right.iter())
+        .map(|s| s.abs())
+        .fold(0.0f32, f32::max);
+    let scale = if peak > 0.90 { 0.90 / peak } else { 1.0 };
+
+    use crate::dsp::interleave_stereo;
+    let left_scaled:  Vec<f32> = left.into_iter().map(|s| s * scale).collect();
+    let right_scaled: Vec<f32> = right.into_iter().map(|s| s * scale).collect();
+    interleave_stereo(left_scaled, right_scaled)
+}
+
+fn violin_mono_voice(f0: f32, duration_ms: u64, sample_rate: u32, seed: u32) -> Vec<f32> {
+    let dur = duration_ms.max(200);
+    let n   = ms_to_samples(dur, sample_rate);
+    let sr  = sample_rate;
+    let mut out = vec![0.0f32; n];
+
+    // NEW — Bow Pressure Envelope: sangat tipis → tipis → normal → tipis → sangat tipis
+// Ini model fisik gesek busur yang sebenarnya:
+// - Busur menyentuh senar pelan (sangat tipis di awal)
+// - Tekanan bow bertambah → suara normal
+// - Sebelum angkat busur, tekanan berkurang → kembali sangat tipis
+let env: Vec<f32> = {
+    let swell_ms   = (dur as f32 * 0.18).max(80.0) as u64;  // 18% pertama: bow contact
+    let sustain_ms = (dur as f32 * 0.64) as u64;             // 64% tengah: full bow tone
+    let taper_ms   = dur - swell_ms - sustain_ms;            // sisa: bow lift
+
+    let swell_n   = ms_to_samples(swell_ms,   sr);
+    let sustain_n = ms_to_samples(sustain_ms, sr);
+    let taper_n   = ms_to_samples(taper_ms,   sr).max(1);
+
+    let mut e = vec![0.0f32; n];
+    for i in 0..n {
+        e[i] = if i < swell_n {
+            // Bow contact: sangat tipis → naik secara kuadratik
+            // pow(3) membuat awal sangat sangat tipis (hampir nol)
+            let t = i as f32 / swell_n.max(1) as f32;
+            t * t * t   // 0.0 → 1.0, sangat lambat di awal
+        } else if i < swell_n + sustain_n {
+            // Full bow pressure: sustain konstan
+            1.0f32
+        } else {
+            // Bow lift: tipis → sangat tipis (linear + squared taper)
+            let t = (i - swell_n - sustain_n) as f32 / taper_n as f32;
+            let t = t.min(1.0);
+            // Kuadrat terbalik: turun lambat dulu, lalu cepat di akhir
+            (1.0 - t * t).max(0.0)
+        };
+    }
+    e
+};
+    
+    // ── INHARMONICITY: Senar violin sangat tipis → rendah ──────────────
+    let b_coeff = 0.000005f32 * (f0 / 200.0).max(0.5).min(3.0);
+
+    // ── BOWED STRING MODEL (Helmholtz Motion) ──────────────────────────
+    // Gelombang Helmholtz ≈ SAWTOOTH murni (1/h rolloff),
+    // sangat berbeda dari clarinet/sax yang dominan harmonik GANJIL.
+    // Ini yang membedakan gesek vs tiup secara spektral.
+    const NH: usize = 24; // lebih banyak harmonik untuk kekayaan gesek
+    let mut phases = [0.0f32; NH];
+
+    // ── BOW PRESSURE STATE (Simulasi tekanan busur) ─────────────────────
+    // Stick-slip: output asymmetric saat bow "stick", release saat "slip"
+    let mut bow_state = 0.0f32;
+    let bow_stiffness = 0.35f32; // koefisien gesekan
+
+    // ── ROSIN SCRAPE TRANSIENT ──────────────────────────────────────────
+    let mut rng = Rng::new(seed);
+    let mut rosin_bp1 = BandPass::new(f0 * 1.5, 4.0, sr);
+    let mut rosin_bp2 = BandPass::new(f0 * 3.5, 3.0, sr);
+    let rosin_end = ms_to_samples(30, sr); // sedikit lebih panjang
+
+    // ── BODY RESONANCES (Stradivari acoustic modes) ─────────────────────
+    // Mode-mode ini sangat penting untuk karakter "nasal" violin
+    // yang membedakannya dari flute (yang smooth dan rounded)
+    let mut body_a0   = BandPass::new(270.0,  8.0, sr);  // A0: woody bass warmth
+    let mut body_air  = BandPass::new(390.0,  6.5, sr);  // Air mode
+    let mut body_b1lo = BandPass::new(465.0,  7.0, sr);  // B1-: body richness
+    let mut body_b1hi = BandPass::new(550.0,  6.0, sr);  // B1+: Helmholtz coupling
+    let mut bridge_lo = BandPass::new(2100.0, 5.5, sr);  // Bridge hill: nasal projection
+    let mut bridge_hi = BandPass::new(3200.0, 4.5, sr);  // Bridge upper: brightness
+    // Tambahan: "Wolf tone" suppressor & presence enhancer
+    let mut upper_presence = BandPass::new(4500.0, 3.5, sr);
+
+    // Low-pass untuk membuang digital artifact di atas 9kHz
+    let mut silk_lp = LowPassBiquad::new(8800.0, 0.60, sr);
+
+    // High-shelf tipis untuk "air" konser
+    //let mut air_shelf = HighShelf::new(4800.0, 3.5, sr);
+    let mut air_shelf = HighShelf::new(5500.0, 3.5, sr); // boost sangat kecil, frekuensi lebih tinggi
+
+    // Sedikit warmth boost di bawah
+    let mut warmth_lp = LowPassBiquad::new(800.0, 0.7, sr);
+
+    // ── BOW CHANGE (perubahan arah bow) ────────────────────────────────
+    let bow_change_pos = ms_to_samples((dur / 2).min(800), sr);
+    let bow_change_dur = ms_to_samples(12, sr).max(1);
+
+    // ── MAIN LOOP ────────────────────────────────────────────────────────
+    for (i, slot) in out.iter_mut().enumerate() {
+        let t = i as f32 / sr as f32;
+
+        // Vibrato: karakteristik pemain violin klasik — lambat berkembang
+        let vib_grow  = (1.0 - (-t / 0.22).exp()).powf(1.8); // tumbuh lebih lambat
+        let vib_amt   = 0.010 * vib_grow; // sedikit lebih dalam dari sebelumnya
+        let vib = 1.0 + vib_amt * (2.0 * PI * 5.2 * t).sin()
+                      + vib_amt * 0.08 * (2.0 * PI * 10.4 * t).sin(); // overtone vibrato
+
+        // Micro-intonation drift (manusiawi)
+        let drift = 1.0 + 0.00035 * (2.0 * PI * 0.13 * t).sin();
+        let f_inst = f0 * vib * drift;
+
+        // ── HELMHOLTZ SAWTOOTH SYNTHESIS ─────────────────────────────
+        // Bowed string = sawtooth: amplitudo 1/h MERATA untuk semua harmonik
+        // (BERBEDA dari sax/flute yang dominan harmonik ganjil!)
+        let mut saw = 0.0f32;
+        for h in 1..=NH {
+            let stretch = (1.0 + b_coeff * (h * h) as f32).sqrt();
+            let f_h = f_inst * h as f32 * stretch;
+            if f_h >= sr as f32 * 0.46 { break; }
+
+            // TRUE SAWTOOTH rolloff: 1/h untuk SEMUA harmonik (genap & ganjil sama)
+            // Ini ciri khas alat gesek vs alat tiup
+            let amp = match h {
+                1 => 1.00,
+                2 => 0.50,
+                3 => 0.33,
+                4 => 0.25,
+                5 => 0.20,
+                6 => 0.17,
+                7 => 0.14,
+                8 => 0.12,
+                _ => 1.0 / h as f32,
+            };
+
+            // Bow speed modulation: harmonik tinggi sedikit lebih responsif
+            let bow_mod = 1.0 + 0.04 * (h as f32 / NH as f32);
+
+            phases[h - 1] += 2.0 * PI * f_h / sr as f32;
+            saw += phases[h - 1].sin() * amp * bow_mod;
+        }
+        saw *= 0.09; // level dasar — lebih tipis agar saturasi tidak terjadi
+
+        // ── STICK-SLIP NONLINEARITY (kunci suara gesek!) ─────────────
+        // Model Helmholtz: bow "sticks" ke senar lalu "slips"
+        // Menghasilkan asymmetric clipping yang khas alat gesek
+        // (BERBEDA dari tanh simetris yang terdengar seperti reed/tiup)
+        let bow_vel = saw - bow_state * bow_stiffness;
+
+        // Slip condition: asymmetric nonlinearity
+        let bowed = if bow_vel.abs() < 0.4 {
+            // STICK phase: gesekan kuat, output mengikuti bow
+            bow_state = bow_state * 0.96 + bow_vel * 0.55;
+            bow_vel * 1.8 + bow_vel * bow_vel * bow_vel * 0.3 // slight asymmetry
+        } else {
+            // SLIP phase: senar meluncur bebas
+            bow_state = bow_state * 0.88;
+            // Hard asymmetric clip — inilah yang membuat violin terdengar "gesek"
+            let s = saw * 1.6;
+            if s > 0.0 {
+                s.min(0.85) * 1.0 + s * 0.05 // clip lebih keras di atas
+            } else {
+                s.max(-0.72) * 1.0 + s * 0.08 // lebih lembut di bawah (asymmetry!)
+            }
+        };
+
+        // ── ROSIN TRANSIENT ───────────────────────────────────────────
+        let rosin = if i < rosin_end {
+            let env_r = (-t / 0.015).exp();
+            let n1 = rng.next_f32();
+            let n2 = rng.next_f32();
+            (rosin_bp1.process(n1) * 0.65 + rosin_bp2.process(n2) * 0.40) * env_r * 0.22
+        } else {
+            0.0
+        };
+
+        // ── BOW DIRECTION CHANGE ──────────────────────────────────────
+        let bow_click = if i >= bow_change_pos && i < bow_change_pos + bow_change_dur {
+            let t_click = (i - bow_change_pos) as f32 / bow_change_dur as f32;
+            let impulse = (PI * t_click).sin();
+            impulse * rng.next_f32() * 0.018
+        } else {
+            0.0
+        };
+
+        let raw = bowed + rosin + bow_click;
+
+        // ── BODY RESONANCE (violin wood modes) ───────────────────────
+        // Boost signifikan pada bridge hill (2-3kHz) adalah ciri khas
+        // violin yang membedakannya dari flute/sax (yang lebih smooth)
+        let warmth = warmth_lp.process(raw) * 0.15; // sedikit warmth
+let resonated = raw
+    + body_a0.process(raw)       * 0.35
+    + body_air.process(raw)      * 0.25
+    + body_b1lo.process(raw)     * 0.32
+    + body_b1hi.process(raw)     * 0.28
+    + bridge_lo.process(raw)     * 0.52   // bridge lebih kuat = nasal violin tone
+    + bridge_hi.process(raw)     * 0.38   // brightness khas violin
+    + upper_presence.process(raw)* 0.20   // presence 4.5kHz
+    + warmth;
+
+        // Silk low-pass (potong artifak digital)
+        let silked = silk_lp.process(resonated);
+
+        // Air shelf
+        let aired = air_shelf.process(silked);
+
+        // Final output: TIDAK pakai tanh simetris murni!
+        // Gunakan soft asymmetric saturation untuk menjaga karakter gesek
+        let driven = aired * 0.65; // drive kecil — cegah saturasi yang bikin suara tebal
+        let saturated = if driven > 0.0 {
+            1.0 - (-driven).exp()         // eksponen asimetris (lebih natural)
+        } else {
+            -1.0 + (driven).exp()
+        };
+
+        *slot = saturated * env[i] * 0.92;  // naikkan gain karena envelope baru lebih konservatif
+    }
+
+    out
+}
+
+
+// ====================================================================
+// VIOLA — Bowed String, lebih gelap & warm dari violin
+//
+// Perbedaan fisik dari violin:
+//   - Senar lebih tebal → suara lebih grainy, dark, kurang bright
+//   - Body lebih besar → resonansi di frekuensi lebih rendah
+//   - Range: C3–A5 (satu kuintal lebih rendah dari violin)
+//   - Vibrato lebih lambat & lebih dalam
+//   - Karakter: "nasal warm" bukan "nasal bright" seperti violin
+// ====================================================================
+
+pub fn synth_viola_note(token: &str, duration_ms: u64, sample_rate: u32) -> Vec<f32> {
+    // Viola default oktaf 4 → tapi mapping not-nya di lib.rs pakai oktaf lebih rendah
+    let f0 = single_note_freq(token, 4); // oktaf 4 = range viola (C3–A5 tergantung token)
+    if f0 < 1.0 { return vec![0.0; dsp::ms_to_samples(duration_ms, sample_rate) * 2]; }
+
+    let left  = viola_mono_voice(f0, duration_ms, sample_rate, 0x7A3C_D1F2);
+    let mut right = viola_mono_voice(f0, duration_ms, sample_rate, 0xBEEF_A5C0);
+
+    // Stereo chorus lebih lebar dari violin (body viola lebih besar)
+    for (i, s) in right.iter_mut().enumerate() {
+        let lfo = (2.0 * PI * 0.27 * i as f32 / sample_rate as f32).sin() * 0.000075;
+        *s *= 1.0 + lfo;
+    }
+
+    let peak = left.iter().chain(right.iter())
+        .map(|s| s.abs())
+        .fold(0.0f32, f32::max);
+    let scale = if peak > 0.90 { 0.90 / peak } else { 1.0 };
+
+    let left_scaled:  Vec<f32> = left.into_iter().map(|s| s * scale).collect();
+    let right_scaled: Vec<f32> = right.into_iter().map(|s| s * scale).collect();
+    interleave_stereo(left_scaled, right_scaled)
+}
+
+fn viola_mono_voice(f0: f32, duration_ms: u64, sample_rate: u32, seed: u32) -> Vec<f32> {
+    let dur = duration_ms.max(200);
+    let n   = ms_to_samples(dur, sample_rate);
+    let sr  = sample_rate;
+    let mut out = vec![0.0f32; n];
+
+    // ── BOW PRESSURE ENVELOPE (sama dengan violin) ──────────────────
+    let env: Vec<f32> = {
+        let swell_ms   = (dur as f32 * 0.18).max(80.0) as u64;
+        let sustain_ms = (dur as f32 * 0.64) as u64;
+        let taper_ms   = dur - swell_ms - sustain_ms;
+        let swell_n   = ms_to_samples(swell_ms,   sr);
+        let sustain_n = ms_to_samples(sustain_ms, sr);
+        let taper_n   = ms_to_samples(taper_ms,   sr).max(1);
+        let mut e = vec![0.0f32; n];
+        for i in 0..n {
+            e[i] = if i < swell_n {
+                let t = i as f32 / swell_n.max(1) as f32;
+                t * t * t
+            } else if i < swell_n + sustain_n {
+                1.0f32
+            } else {
+                let t = (i - swell_n - sustain_n) as f32 / taper_n as f32;
+                (1.0 - t.min(1.0) * t.min(1.0)).max(0.0)
+            };
+        }
+        e
+    };
+
+    // ── INHARMONICITY: senar viola lebih tebal → sedikit lebih tinggi ──
+    let b_coeff = 0.000012f32 * (f0 / 150.0).max(0.5).min(3.0);
+
+    // ── HELMHOLTZ SAWTOOTH (sama, tapi saw level lebih hangat) ─────────
+    const NH: usize = 20; // sedikit lebih sedikit harmonik tinggi (senar tebal = rolloff lebih cepat)
+    let mut phases = [0.0f32; NH];
+
+    // ── BOW PRESSURE STATE ───────────────────────────────────────────
+    let mut bow_state = 0.0f32;
+    let bow_stiffness = 0.28f32; // lebih rendah dari violin (senar lebih tebal = grip berbeda)
+
+    // ── ROSIN SCRAPE TRANSIENT ────────────────────────────────────────
+    let mut rng = Rng::new(seed);
+    // Frekuensi rosin lebih rendah dari violin (senar lebih tebal)
+    let mut rosin_bp1 = BandPass::new(f0 * 1.2, 3.5, sr);
+    let mut rosin_bp2 = BandPass::new(f0 * 2.8, 2.8, sr);
+    let rosin_end = ms_to_samples(35, sr);
+
+    // ── BODY RESONANCES — VIOLA lebih gelap & warm ────────────────────
+    // Frekuensi lebih rendah ~15-20% dari violin karena body lebih besar
+    let mut body_a0   = BandPass::new(220.0,  8.0, sr);  // A0 lebih rendah
+    let mut body_air  = BandPass::new(320.0,  6.0, sr);  // Air mode
+    let mut body_b1lo = BandPass::new(390.0,  7.5, sr);  // B1-
+    let mut body_b1hi = BandPass::new(460.0,  6.5, sr);  // B1+
+    // Bridge hill viola: lebih rendah & lebih "nasal warm" dari violin
+    let mut bridge_lo = BandPass::new(1600.0, 5.0, sr);  // bridge hill lebih rendah
+    let mut bridge_hi = BandPass::new(2400.0, 4.0, sr);  // brightness lebih redup
+    let mut upper_presence = BandPass::new(3500.0, 3.0, sr); // presence lebih rendah
+
+    // Low-pass lebih agresif dari violin → potong brightness tinggi
+    let mut silk_lp = LowPassBiquad::new(7000.0, 0.65, sr);
+
+    // Air shelf lebih rendah & boost kecil → viola tidak "shimmery"
+    let mut air_shelf = HighShelf::new(4000.0, 0.8, sr);
+
+    // Warmth boost sedikit lebih besar dari violin (body lebih besar = lebih warm)
+    let mut warmth_lp = LowPassBiquad::new(600.0, 0.80, sr);
+
+    // ── BOW CHANGE ───────────────────────────────────────────────────
+    let bow_change_pos = ms_to_samples((dur / 2).min(800), sr);
+    let bow_change_dur = ms_to_samples(14, sr).max(1);
+
+    // ── MAIN LOOP ─────────────────────────────────────────────────────
+    for (i, slot) in out.iter_mut().enumerate() {
+        let t = i as f32 / sr as f32;
+
+        // Vibrato viola: lebih lambat & sedikit lebih dalam dari violin
+        let vib_grow  = (1.0 - (-t / 0.28).exp()).powf(2.0); // tumbuh lebih lambat
+        let vib_amt   = 0.013 * vib_grow; // lebih dalam dari violin (0.010)
+        let vib = 1.0 + vib_amt * (2.0 * PI * 4.8 * t).sin() // lebih lambat (violin 5.2Hz)
+                      + vib_amt * 0.06 * (2.0 * PI * 9.6 * t).sin();
+
+        let drift = 1.0 + 0.00045 * (2.0 * PI * 0.11 * t).sin(); // drift sedikit lebih besar
+        let f_inst = f0 * vib * drift;
+
+        // ── HELMHOLTZ SAWTOOTH ─────────────────────────────────────
+        let mut saw = 0.0f32;
+        for h in 1..=NH {
+            let stretch = (1.0 + b_coeff * (h * h) as f32).sqrt();
+            let f_h = f_inst * h as f32 * stretch;
+            if f_h >= sr as f32 * 0.46 { break; }
+
+            // Sawtooth 1/h rolloff — sama dengan violin, tapi rolloff lebih cepat di HF
+            // (senar tebal = harmonik tinggi lebih redup)
+            let amp = match h {
+                1 => 1.00,
+                2 => 0.50,
+                3 => 0.33,
+                4 => 0.25,
+                5 => 0.19,
+                6 => 0.15,
+                7 => 0.12,
+                8 => 0.09,  // viola lebih redup dari h=8 ke atas
+                _ => 0.85 / h as f32, // rolloff lebih cepat dari violin
+            };
+
+            let bow_mod = 1.0 + 0.03 * (h as f32 / NH as f32);
+            phases[h - 1] += 2.0 * PI * f_h / sr as f32;
+            saw += phases[h - 1].sin() * amp * bow_mod;
+        }
+        saw *= 0.09; // sama dengan violin yang sudah difix
+
+        // ── STICK-SLIP (sama dengan violin) ──────────────────────────
+        let bow_vel = saw - bow_state * bow_stiffness;
+        let bowed = if bow_vel.abs() < 0.4 {
+            bow_state = bow_state * 0.96 + bow_vel * 0.55;
+            bow_vel * 1.8 + bow_vel * bow_vel * bow_vel * 0.3
+        } else {
+            bow_state = bow_state * 0.88;
+            let s = saw * 1.6;
+            if s > 0.0 {
+                s.min(0.85) * 1.0 + s * 0.05
+            } else {
+                s.max(-0.72) * 1.0 + s * 0.08
+            }
+        };
+
+        // ── ROSIN TRANSIENT ───────────────────────────────────────────
+        let rosin = if i < rosin_end {
+            let env_r = (-t / 0.018).exp();
+            let n1 = rng.next_f32();
+            let n2 = rng.next_f32();
+            (rosin_bp1.process(n1) * 0.55 + rosin_bp2.process(n2) * 0.35) * env_r * 0.20
+        } else {
+            0.0
+        };
+
+        // ── BOW DIRECTION CHANGE ──────────────────────────────────────
+        let bow_click = if i >= bow_change_pos && i < bow_change_pos + bow_change_dur {
+            let t_click = (i - bow_change_pos) as f32 / bow_change_dur as f32;
+            let impulse = (PI * t_click).sin();
+            impulse * rng.next_f32() * 0.015
+        } else {
+            0.0
+        };
+
+        let raw = bowed + rosin + bow_click;
+
+        // ── BODY RESONANCE (viola = lebih warm, kurang bright) ────────
+        let warmth = warmth_lp.process(raw) * 0.06; // sedikit lebih besar dari violin
+        let resonated = raw
+            + body_a0.process(raw)        * 0.08
+            + body_air.process(raw)       * 0.10
+            + body_b1lo.process(raw)      * 0.09
+            + body_b1hi.process(raw)      * 0.11
+            + bridge_lo.process(raw)      * 0.28   // bridge lebih redup dari violin
+            + bridge_hi.process(raw)      * 0.18   // brightness lebih kecil dari violin
+            + upper_presence.process(raw) * 0.10   // presence lebih kecil
+            + warmth;
+
+        let silked  = silk_lp.process(resonated);
+        let aired   = air_shelf.process(silked);
+
+        // Saturasi asimetris sama seperti violin
+        let driven = aired * 0.65;
+        let saturated = if driven > 0.0 {
+            1.0 - (-driven).exp()
+        } else {
+            -1.0 + driven.exp()
+        };
+
+        *slot = saturated * env[i] * 1.35;
+    }
+
+    out
+}
