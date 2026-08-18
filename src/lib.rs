@@ -124,7 +124,14 @@ pub enum Instrument {
     Bass,    
     Guitar,  
     Violin,
-    Viola
+    Viola,
+    Organ,
+    Trumpet,
+    Saron,
+    Demung,
+    Bonang,
+    Kenong,
+    Kempul
 }
 
 impl Instrument {
@@ -138,6 +145,13 @@ impl Instrument {
             "guitar" | "elec_guitar" | "distortion" | "heavy_guitar" => Instrument::Guitar,
             "violin" | "fiddle" => Instrument::Violin,
             "viola" => Instrument::Viola,
+            "organ" | "hammond" | "keys_organ" => Instrument::Organ,  
+            "trumpet" | "ska_trumpet" | "brass" => Instrument::Trumpet,
+            "saron" | "gamelan_saron" => Instrument::Saron,
+            "demung" | "gamelan_demung" => Instrument::Demung,
+            "bonang" | "gamelan_bonang" | "bonang_barung" | "bonang_panerus" => Instrument::Bonang,
+            "kenong" | "gamelan_kenong" => Instrument::Kenong,
+            "kempul" | "gamelan_kempul" => Instrument::Kempul,
             other => panic!("[f_audio] Instrumen tidak dikenal: '{}'\nInstrumen yang tersedia: drum, piano, sax, flute, bass, guitar", other),
         }
     }
@@ -165,6 +179,17 @@ impl Instrument {
             Instrument::Guitar => (0.50, 0.65),  // gitar cukup lebar
             Instrument::Violin => (0.50, 0.60),  // violin agak lebar, natural
             Instrument::Viola  => (0.50, 0.55),  // viola sedikit lebih narrow dari violin
+            Instrument::Organ  => (0.50, 0.85),  // Leslie = paling lebar, mengisi ruang
+            Instrument::Trumpet => (0.50, 0.50),  // ska: center-ish, punchy
+            Instrument::Saron   => (0.50, 0.40),  // gamelan: center, ruang natural
+            Instrument::Demung  => (0.50, 0.35),  // lebih center, boomy
+            Instrument::Bonang  => (0.50, 0.55),  // bonang: lebih lebar karena beating stereo
+            Instrument::Kenong  => (0.50, 0.45),  // besar, center, resonan
+            Instrument::Kempul  => (0.50, 0.50), // swing mode = sedikit lebar
+      
+    
+
+
         }
     }
     
@@ -423,6 +448,17 @@ impl Project {
             Instrument::Bass => 300,
             Instrument::Violin => 120,
             Instrument::Viola  => 120,
+            Instrument::Organ  => 200,
+            Instrument::Trumpet => 80,   // fall pendek, release cepat
+            Instrument::Saron   => 50,   // damping oleh tangan, release sangat pendek
+            Instrument::Demung  => 80,  // decay lebih panjang
+            Instrument::Bonang  => 150,  // sustain panjang, release smooth
+            Instrument::Kenong  => 200,  // sustain sangat panjang
+            Instrument::Kempul  => 220,
+
+   
+     
+
             _ => 200,
         };
 
@@ -448,6 +484,13 @@ impl Project {
         Instrument::Guitar => (synth::synth_guitar_chord_stereo(token, total_ms, sr, preset), 2),
         Instrument::Violin => (synth::synth_violin_note(token, total_ms, sr), 2),
         Instrument::Viola  => (synth::synth_viola_note(token, total_ms, sr), 2),
+        Instrument::Organ  => (synth::synth_organ_note(token, total_ms, sr), 2),
+        Instrument::Trumpet => (synth::synth_trumpet_note(token, total_ms, sr), 2),
+        Instrument::Saron   => (synth::synth_saron_note(token, total_ms, sr), 2),
+        Instrument::Demung  => (synth::synth_demung_note(token, total_ms, sr), 2),
+            Instrument::Bonang  => (synth::synth_bonang_note(token, total_ms, sr), 2),
+            Instrument::Kenong  => (synth::synth_kenong_note(token, total_ms, sr), 2),
+            Instrument::Kempul  => (synth::synth_kempul_note(token, total_ms, sr), 2),
 
     };
 
